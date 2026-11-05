@@ -8,7 +8,7 @@ The assessment demo includes a Biology course and a saved demo student account. 
 
 ## Run on Windows
 
-1. Install Python 3 from [python.org](https://www.python.org/downloads/windows/) and enable the Python launcher (`py`).
+1. Install Python 3.10 or later from [python.org](https://www.python.org/downloads/windows/) and enable the Python launcher (`py`).
 2. Open the project folder and double-click `run_windows.bat`.
 3. Open `http://127.0.0.1:8000` in Edge or Chrome.
 
