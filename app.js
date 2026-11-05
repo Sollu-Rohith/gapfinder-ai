@@ -282,14 +282,15 @@
     if (Array.isArray(state.planTasks) && state.planTasks.length) return state.planTasks;
     const ranked = rankedTopics().map(item => ({ ...item, importance: ({ Photosynthesis: 1.35, Genetics: 1.25, 'Membrane transport': 1.15, 'Cellular respiration': 1.15, Ecology: .95, 'Cell structure': .9 })[item.topic] || 1 }));
     const totalMinutes = state.planDays * state.hoursPerDay * 60;
-    let blocks = Math.max(ranked.length, Math.floor(totalMinutes / 25));
+    const sessionsPerDay = Math.min(8, Math.max(1, Math.floor(state.hoursPerDay * 2)));
+    let blocks = Math.max(ranked.length, Math.min(state.planDays * sessionsPerDay, Math.floor(totalMinutes / 30)));
     const priorities = ranked.map(item => ({ ...item, weight: (105 - item.score) * item.importance })).sort((a,b) => b.weight-a.weight);
     const tasks = [];
     const verbs = ['Review key ideas', 'Practise active recall', 'Try past-paper questions', 'Explain it from memory', 'Recheck your understanding'];
     for (let i = 0; i < blocks; i++) {
       const item = priorities[i % priorities.length];
       const day = Math.floor(i / Math.max(1, Math.ceil(blocks / state.planDays))) + 1;
-      tasks.push({ id: `task-${i}-${item.topic}`, day: Math.min(state.planDays, day), topic: item.topic, title: `${verbs[i % verbs.length]} · ${item.topic}`, description: i % verbs.length === 0 ? `Start with the cited notes, then write down the main idea without looking. ${examFrequency(item.topic)}.` : i % verbs.length === 1 ? 'Close your notes and recall the process or key terms in your own words.' : 'Use a relevant question from your past paper and check your reasoning against the notes.', minutes: 25 });
+      tasks.push({ id: `task-${i}-${item.topic}`, day: Math.min(state.planDays, day), topic: item.topic, title: `${verbs[i % verbs.length]} · ${item.topic}`, description: i % verbs.length === 0 ? `Start with the cited notes, then write down the main idea without looking. ${examFrequency(item.topic)}.` : i % verbs.length === 1 ? 'Close your notes and recall the process or key terms in your own words.' : 'Use a relevant question from your past paper and check your reasoning against the notes.', minutes: 30 });
     }
     state.planTasks = tasks; save(); return tasks;
   }
