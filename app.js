@@ -22,7 +22,7 @@
     { id: 'seed-paper', name: 'June practice paper.txt', kind: 'paper', text: SEED_PAPER, seeded: true }
   ];
   const freshState = () => ({
-    documents: seedDocuments(), mastery: { ...initialMastery }, attempts: [
+    documents: seedDocuments(), mastery: { ...initialMastery }, paperMap: [], paperMapSignature: '', attempts: [
       { id: 'demo-a1', date: '2026-10-26', label: 'Diagnostic 1', percent: 48, topicScores: { 'Cell structure': 72, 'Membrane transport': 36, Photosynthesis: 32, 'Cellular respiration': 52, Genetics: 68, Ecology: 44 } },
       { id: 'demo-a2', date: '2026-11-02', label: 'Diagnostic 2', percent: 62, topicScores: { 'Cell structure': 82, 'Membrane transport': 48, Photosynthesis: 42, 'Cellular respiration': 68, Genetics: 76, Ecology: 57 } }
     ], planDays: 5, hoursPerDay: 2, completedTasks: [], lastReview: null
@@ -31,6 +31,9 @@
   let loggedIn = localStorage.getItem(AUTH_KEY) === 'yes';
   let currentView = 'overview';
   let quizSession = null;
+  let aiBusy = false;
+  let mappingBusy = false;
+  let aiStatus = { configured: false, provider: 'Local retrieval', model: null };
   let toastTimer = 0;
   let activeUploadKind = 'notes';
   let mobileNavOpen = false;
@@ -76,6 +79,71 @@
     if (!items.length) items = Object.keys(state.mastery);
     return items;
   }
+  function apiPost(path, payload) {
+    return fetch(`/api/${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || `The study service returned ${response.status}.`);
+        return body;
+      });
+  }
+  function extractPaperQuestions() {
+    const questions = [];
+    for (const doc of docsOf('paper')) {
+      let section = 'Questions';
+      const lines = doc.text.replace(/\r/g, '').split('\n');
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        const heading = line.match(/^#{1,6}\s*(.+)$/) || line.match(/^(?:unit|chapter|section)\s+[^:—-]+[:—-]\s*(.+)$/i);
+        if (heading) { section = heading[1].replace(/\s+/g, ' ').trim(); continue; }
+        const candidates = line.match(/(?:explain|describe|state|why|name|what|how|compare|define|list|give|calculate|identify|which|outline|discuss)\b[^.!?]{12,}[.!?]?/gi) || [];
+        for (const candidate of candidates) {
+          const text = cleanSentence(candidate);
+          if (text.length < 18) continue;
+          const id = `${doc.id}-paper-${questions.length}`;
+          if (!questions.some(item => item.text.toLowerCase() === text.toLowerCase())) questions.push({ id, text, citation: `${doc.name} · ${section}` });
+        }
+      }
+    }
+    return questions;
+  }
+  function mapPaperQuestionsLocally() {
+    const topics = currentTopics();
+    const notes = getChunks().filter(chunk => chunk.kind !== 'paper');
+    return extractPaperQuestions().map(question => {
+      const match = notes.map(chunk => ({ chunk, score: scoreText(question.text, `${chunk.topic} ${chunk.text}`) })).sort((a,b) => b.score-a.score)[0];
+      const topic = match?.score > 0 ? match.chunk.topic : 'Unmapped';
+      return { ...question, topic, evidenceCitation: topic === 'Unmapped' ? '' : match.chunk.citation, reason: topic === 'Unmapped' ? 'No matching note passage found.' : 'Matched to the closest note passage by topic and keyword overlap.', confidence: topic === 'Unmapped' ? 'Unmapped' : 'Local match' };
+    });
+  }
+  function getPaperMapSignature() {
+    return `${currentTopics().join('|')}::${state.documents.filter(doc => doc.kind === 'notes' || doc.kind === 'paper').map(doc => `${doc.id}:${hash(doc.text)}`).join('|')}`;
+  }
+  function ensurePaperMap() {
+    const signature = getPaperMapSignature();
+    if (state.paperMapSignature === signature || mappingBusy) return;
+    state.paperMap = mapPaperQuestionsLocally();
+    state.paperMapSignature = signature;
+    state.planTasks = null;
+    save();
+    if (!aiStatus.configured || !state.paperMap.length) return;
+    mappingBusy = true;
+    apiPost('map-papers', { topics: currentTopics(), questions: extractPaperQuestions(), chunks: getChunks() })
+      .then(result => {
+        if (state.paperMapSignature === signature && Array.isArray(result.matches)) {
+          state.paperMap = result.matches;
+          state.paperMapSignature = signature;
+          state.planTasks = null;
+          save(); render();
+        }
+      })
+      .catch(error => { console.warn('AI past-paper mapping unavailable:', error.message); })
+      .finally(() => {
+        mappingBusy = false;
+        if (state.paperMapSignature !== getPaperMapSignature()) render();
+      });
+  }
   function stopWords() { return new Set('a about above after again against all also am an and any are as at be because been before being between both but by can could did do does doing down during each few for from further had has have having he her here hers herself him himself his how i if in into is it its itself just less many may me might more most must my myself no nor not of off on once only or other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there these they this those through to too under until up very was we were what when where which while who why will with within would you your yours yourself yourselves'.split(/\s+/)); }
   function words(text) { return String(text).toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []; }
   function scoreText(query, content) {
@@ -105,8 +173,9 @@
       const line = raw.trim();
       if (!line) { if (buf.length > 3) flush(); continue; }
       const heading = line.match(/^(?:#{1,6}\s*|\d+[.)]\s*|(?:unit|chapter|section)\s+[\w.:-]+\s*[:—-]?\s*)(.{0,90})$/i);
-      const isHeading = heading && (line.startsWith('#') || /^(?:unit|chapter|section)\b/i.test(line) || (line.length < 56 && !/[.!?]$/.test(line) && !line.includes(',')));
-      if (isHeading) { flush(); title = (heading[1] || heading[0]).replace(/^#+\s*/, '').trim() || line; continue; }
+      const syllabusHeading = currentTopics().some(topic => topic.toLowerCase() === line.toLowerCase());
+      const isHeading = syllabusHeading || (heading && (line.startsWith('#') || /^(?:unit|chapter|section)\b/i.test(line) || (line.length < 56 && !/[.!?]$/.test(line) && !line.includes(',')));
+      if (isHeading) { flush(); title = syllabusHeading ? line : (heading[1] || heading[0]).replace(/^#+\s*/, '').trim() || line; continue; }
       buf.push(line);
       if (buf.join(' ').length > 900) flush();
     }
@@ -154,8 +223,8 @@
     return topic === 'Photosynthesis' ? 'Light-dependent reactions and the Calvin cycle are easy to mix up. Review where each stage happens.' : `Recent checks show this topic needs a little more recall practice. Review your notes, then explain the key idea in your own words.`;
   }
   function examFrequency(topic) {
-    const counts = { Photosynthesis: 'Often tested', Genetics: 'Often tested', 'Membrane transport': 'Regularly tested', 'Cellular respiration': 'Regularly tested', Ecology: 'Sometimes tested', 'Cell structure': 'Sometimes tested' };
-    return counts[topic] || 'In your syllabus';
+    const count = (state.paperMap || []).filter(item => item.topic === topic).length;
+    return count ? `${count} past-paper question${count === 1 ? '' : 's'}` : 'Not seen in uploaded papers';
   }
 
   function shell(viewHTML) {
@@ -175,7 +244,7 @@
         </div>
       </aside>
       <main class="main">
-        <header class="topbar"><div class="top-actions"><button class="icon-button mobile-menu" data-action="menu" aria-label="Open menu">☰</button><div class="breadcrumb">Workspace <span aria-hidden="true">/</span> <strong>${esc(title)}</strong></div></div><div class="top-actions"><span class="course-pill">Biology · Year 11</span><span class="days-pill"><i class="dot"></i> Exam in ${state.planDays} days</span><button class="icon-button" data-route="materials" aria-label="Study material">${icon('materials')}</button></div></header>
+        <header class="topbar"><div class="top-actions"><button class="icon-button mobile-menu" data-action="menu" aria-label="Open menu">☰</button><div class="breadcrumb">Workspace <span aria-hidden="true">/</span> <strong>${esc(title)}</strong></div></div><div class="top-actions"><span class="ai-pill ${aiStatus.configured ? 'active' : ''}"><i></i>${aiStatus.configured ? `AI · ${esc(aiStatus.model)}` : 'Local demo mode'}</span><span class="course-pill">Biology · Year 11</span><span class="days-pill"><i class="dot"></i> Exam in ${state.planDays} days</span><button class="icon-button" data-route="materials" aria-label="Study material">${icon('materials')}</button></div></header>
         ${viewHTML}
       </main>
     </div>`;
@@ -192,7 +261,7 @@
       <section class="hero"><div class="hero-content"><div class="hero-kicker"><span>YOUR NEXT STEP</span> A clearer way to revise</div><h1>Know what you don’t know.</h1><p>Your notes point to a few places worth another look. Take a quick check, find the gaps, and spend your time where it counts.</p><button class="primary-button hero-cta" data-action="start-quiz">Find my gaps <span aria-hidden="true">→</span></button></div><div class="hero-visual" aria-hidden="true"><div class="orbit one"></div><div class="orbit two"></div><i class="orbit-dot"></i><i class="orbit-dot alt"></i><div class="focus-card"><span>TOPIC CONFIDENCE</span><b>Building steadily</b><div class="focus-bars"><i></i><i></i><i></i><i></i><i></i></div></div></div></section>
       <section class="stats-grid"><article class="stat-card"><div class="stat-label">Overall confidence <span>↗</span></div><div class="stat-value">${overallMastery()}%</div><div class="stat-sub">${esc(attemptText)}</div></article><article class="stat-card"><div class="stat-label">Topics mapped <span>⌗</span></div><div class="stat-value">${currentTopics().length}</div><div class="stat-sub">From your uploaded syllabus</div></article><article class="stat-card"><div class="stat-label">Need a closer look <span>◎</span></div><div class="stat-value">${ranked.filter(t => t.level === 'weak').length}</div><div class="stat-sub">Topics below 55% confidence</div></article><article class="stat-card"><div class="stat-label">Study time planned <span>◷</span></div><div class="stat-value">${state.planDays * state.hoursPerDay}<small style="font-size:11px;color:#77847b"> hrs</small></div><div class="stat-sub">${state.planDays} days · ${state.hoursPerDay} hours a day</div></article></section>
       <div class="dashboard-grid"><section class="panel"><div class="panel-head"><div><h2>Your topic map</h2><p>Confidence across the topics in your syllabus</p></div><button class="text-button" data-route="report">Full gap report →</button></div><div class="topic-list">${ranked.map(item => topicRow(item.topic, item.score, item.level)).join('')}</div><div class="panel-footer"><span>Updated from your latest diagnostic</span><span>Source-based · ${docsOf().length} materials</span></div></section>
-      <section class="panel"><div class="panel-head"><div><h2>Start here</h2><p>Your highest priority right now</p></div><span class="pill weak">FOCUS</span></div><div class="priority-card"><div class="priority-top"><div><div class="priority-title">${esc(weak.topic)}</div><div class="priority-meta">${esc(examFrequency(weak.topic))} · ${weak.score}% confidence</div></div><div class="priority-score">${weak.score}%</div></div><p class="priority-reason">${esc(reasonFor(weak.topic))}</p><div class="priority-actions"><button class="primary-button" data-route="plan">Review this topic</button><button class="secondary-button" data-route="ask">Ask a question</button></div></div><div class="exam-frequency"><span>Today’s planned focus</span><b>${esc(weak.topic)} · 25 min</b></div><div class="exam-frequency"><span>Next checkpoint</span><b>Take a short diagnostic</b></div><div class="panel-footer"><span>Plan adapts after each quiz</span><button class="text-button" data-route="plan">Open plan →</button></div></section></div>`;
+      <section class="panel"><div class="panel-head"><div><h2>Start here</h2><p>Your highest priority right now</p></div><span class="pill weak">FOCUS</span></div><div class="priority-card"><div class="priority-top"><div><div class="priority-title">${esc(weak.topic)}</div><div class="priority-meta">${esc(examFrequency(weak.topic))} · ${weak.score}% confidence</div></div><div class="priority-score">${weak.score}%</div></div><p class="priority-reason">${esc(reasonFor(weak.topic))}</p><div class="priority-actions"><button class="primary-button" data-route="plan">Review this topic</button><button class="secondary-button" data-route="ask">Ask a question</button></div></div><div class="exam-frequency"><span>Today’s planned focus</span><b>${esc(weak.topic)} · 30 min</b></div><div class="exam-frequency"><span>Next checkpoint</span><b>Take a short diagnostic</b></div><div class="panel-footer"><span>Plan adapts after each quiz</span><button class="text-button" data-route="plan">Open plan →</button></div></section></div>`;
   }
   function topicRow(topic, score, lvl) {
     const color = lvl === 'weak' ? '#bd6a56' : lvl === 'medium' ? '#d0a54e' : '#6ba27b';
@@ -203,12 +272,18 @@
     const countWord = docs.length === 1 ? 'source' : 'sources';
     return `<div class="page-heading"><div><div class="eyebrow">Your personal source library</div><h1>Study material</h1><p class="page-subtitle">Upload the syllabus, notes and past papers GapFinder should use.</p></div><button class="primary-button" data-action="upload" data-kind="notes">＋ Add material</button></div>
       <section class="panel"><div class="upload-zone"><div class="upload-copy"><span class="upload-symbol">↑</span><div><strong>Bring your course material together</strong><small>PDF, TXT, MD or CSV · Up to 10 MB per file</small></div></div><div class="upload-actions"><button class="secondary-button" data-action="upload" data-kind="syllabus">＋ Syllabus</button><button class="secondary-button" data-action="upload" data-kind="notes">＋ Notes</button><button class="secondary-button" data-action="upload" data-kind="paper">＋ Past paper</button></div></div><input type="file" id="file-input" accept=".pdf,.txt,.md,.csv,text/plain,text/markdown,text/csv,application/pdf" hidden><div class="card-headline"><div><h2>Saved sources</h2><p class="inline-note" style="margin:5px 0 0">${docs.length} ${countWord} in your workspace</p></div><span class="type-badge">● Private to this browser</span></div><div class="source-list">${docs.length ? docs.map(doc => sourceCard(doc)).join('') : `<div class="empty-state">No material yet. Add a syllabus and some notes to build your topic map.</div>`}</div></section>
-      <div class="dashboard-grid" style="margin-top:16px"><section class="panel"><div class="panel-head"><div><h2>How your material is used</h2><p>GapFinder looks for passages before asking or answering.</p></div></div><div class="method-step"><b>01</b><span><strong>Retrieve</strong> — match each topic and question to your uploaded text.</span></div><div class="method-step"><b>02</b><span><strong>Generate</strong> — create a quick check from a retrieved passage.</span></div><div class="method-step"><b>03</b><span><strong>Cite</strong> — show the filename and section used for each question or explanation.</span></div></section><aside class="info-box"><b>Your sources stay yours.</b><br>Files are read in your browser and saved to this device. This demo uses a transparent text-matching and question-template pipeline; it does not send material to an AI service.</aside></div>`;
+      <div class="dashboard-grid" style="margin-top:16px"><section class="panel"><div class="panel-head"><div><h2>Past paper topic map</h2><p>Questions mapped against your syllabus and uploaded notes</p></div><span class="type-badge">${aiStatus.configured ? `AI · ${esc(aiStatus.model)}` : 'Local mapping'}</span></div>${renderPaperMap()}</section><aside class="panel"><div class="panel-head"><div><h2>How your material is used</h2><p>Retrieval and generation stay separate.</p></div></div><div class="method-step"><b>01</b><span><strong>Retrieve</strong> — rank source passages against the topic or question.</span></div><div class="method-step"><b>02</b><span><strong>Generate</strong> — the model receives only those passages to create questions or explanations.</span></div><div class="method-step"><b>03</b><span><strong>Cite</strong> — accept only returned source IDs and display the stored citation.</span></div><p class="inline-note" style="margin:10px 0 0">${aiStatus.configured ? `Only the retrieved passages and your prompt are sent to ${esc(aiStatus.model)}. Source files stay in this browser.` : 'Add a local API key to enable model-backed generation. Local retrieval remains available without one.'}</p></aside></div>`;
   }
   function sourceCard(doc) {
     const label = ({ syllabus: 'Syllabus', notes: 'Notes', paper: 'Past paper' })[doc.kind] || 'Notes';
     const size = `${Math.max(1, Math.round(doc.text.length / 1024))} KB text`;
     return `<article class="source-card"><div class="file-icon">${doc.name.toLowerCase().endsWith('.pdf') ? 'PDF' : doc.name.split('.').at(-1).toUpperCase().slice(0,3)}</div><div class="source-info"><b>${esc(doc.name)}</b><span>${size} · Added ${doc.seeded ? 'for your demo' : 'just now'}</span></div><span class="source-tag">${label}</span>${doc.seeded ? '' : `<button class="quiet-button" data-action="remove-doc" data-id="${esc(doc.id)}" title="Remove ${esc(doc.name)}" aria-label="Remove ${esc(doc.name)}">×</button>`}</article>`;
+  }
+  function renderPaperMap() {
+    const matches = state.paperMap || [];
+    if (!matches.length) return `<div class="empty-state">No question-like lines found yet. Add a past paper with questions on separate lines to see topic frequency here.</div>`;
+    const counts = currentTopics().map(topic => ({ topic, count: matches.filter(item => item.topic === topic).length })).sort((a,b) => b.count-a.count);
+    return `<div class="topic-list">${counts.map(({topic,count}) => `<div class="exam-frequency"><span>${esc(topic)}</span><b>${count} mapped</b></div>`).join('')}</div><div class="paper-question-list">${matches.map(item => `<article class="paper-question"><div><span class="pill ${item.topic === 'Unmapped' ? 'medium' : 'strong'}">${esc(item.topic)}</span><span class="paper-confidence">${esc(item.confidence || 'Mapped')}</span></div><p>${esc(item.question)}</p><small>${esc(item.citation)}${item.evidenceCitation ? ` · matched to ${esc(item.evidenceCitation)}` : ''}</small></article>`).join('')}</div>`;
   }
 
   function makeQuiz() {
@@ -236,51 +311,88 @@
   }
   function hash(text) { let n = 0; for (let i = 0; i < text.length; i++) n = (n * 31 + text.charCodeAt(i)) | 0; return Math.abs(n); }
   function firstSentence(text) { return cleanSentence((text.match(/[^.!?]+[.!?]+|[^.!?]+$/) || [text])[0]).slice(0, 260); }
+  function normalizeGeneratedQuestions(questions) {
+    return questions.map(question => ({
+      ...question,
+      options: question.options.map(option => typeof option === 'string' ? { text: option, topic: question.topic, citation: question.citation } : option),
+      answerIndex: Number(question.answerIndex)
+    }));
+  }
   function renderQuiz() {
     if (!quizSession) {
       const questionCount = Math.min(6, getChunks().length);
       const materialCount = state.documents.filter(doc => doc.kind !== 'syllabus').length;
-      return `<div class="page-heading"><div><div class="eyebrow">A quick check of what’s sticking</div><h1>Diagnostic quiz</h1><p class="page-subtitle">Questions are built from your saved sources, with the section beside each one.</p></div></div><section class="quiz-intro"><span class="type-badge">✦ Source-grounded check</span><h2>Let’s find your next best revision step.</h2><p>Choose the statement your material supports. After you finish, you’ll see why each answer was right or wrong, which topics need attention, and a revision plan adjusted to your results.</p><div class="quiz-facts"><span><b>${questionCount}</b>quick questions</span><span><b>${materialCount}</b>source documents</span><span><b>~5 min</b>to complete</span></div><button class="primary-button" data-action="begin-quiz" ${questionCount ? '' : 'disabled'}>Begin diagnostic <span aria-hidden="true">→</span></button></section><section class="panel" style="margin-top:15px"><div class="panel-head"><div><h2>Before you begin</h2><p>Every question shows its source section; your answers update the topic map.</p></div></div><div class="info-box">This demo generates answer choices from sentences in your uploaded notes and past papers. It evaluates your selection against the retrieved source passage and displays a citation.</div></section>`;
+      return `<div class="page-heading"><div><div class="eyebrow">A quick check of what’s sticking</div><h1>Diagnostic quiz</h1><p class="page-subtitle">Questions are grounded in retrieved source passages, with the section beside each one.</p></div></div><section class="quiz-intro"><span class="type-badge">✦ ${aiStatus.configured ? `AI-generated · ${esc(aiStatus.model)}` : 'Local demo questions'}</span><h2>Let’s find your next best revision step.</h2><p>Choose the best answer. After you finish, you’ll see why it was right or wrong, which topics need attention, and a revision plan adjusted to your results.</p><div class="quiz-facts"><span><b>${questionCount}</b>quick questions</span><span><b>${materialCount}</b>source documents</span><span><b>~5 min</b>to complete</span></div><button class="primary-button" data-action="begin-quiz" ${questionCount && !aiBusy ? '' : 'disabled'}>${aiBusy ? 'Generating from your sources…' : 'Begin diagnostic →'}</button></section><section class="panel" style="margin-top:15px"><div class="panel-head"><div><h2>Before you begin</h2><p>Questions are made from retrieved passages; each answer is checked and explained.</p></div></div><div class="info-box">${aiStatus.configured ? `Retrieval happens locally first; only the selected passages are sent to ${esc(aiStatus.model)} to create questions and feedback.` : 'Local retrieval is ready. Configure an API key in your local .env file to enable model-backed question generation and feedback.'}</div></section>`;
     }
-    const { questions, index, selected } = quizSession;
+    const { questions, index } = quizSession;
+    const selected = quizSession.answers[index];
     const q = questions[index];
     const pct = Math.round(index / questions.length * 100);
-    return `<div class="page-heading"><div><div class="eyebrow">Diagnostic · ${esc(q.topic)}</div><h1>Show what you know.</h1><p class="page-subtitle">Take your time. You can’t lose progress by going back.</p></div></div><div class="quiz-progress"><span>Question ${index + 1} of ${questions.length}</span><div class="progress-track"><i style="width:${pct}%"></i></div><span>${pct}%</span></div><section class="question-card"><div class="question-overline">${esc(q.topic)} · Question ${index + 1}</div><h2>${esc(q.prompt)}</h2><div class="citation">⌕ Source: ${esc(q.citation)}</div><div class="option-list">${q.options.map((option, i) => `<button class="option ${selected === i ? 'selected' : ''}" data-action="answer" data-index="${i}" aria-pressed="${selected === i}"><span class="option-letter">${String.fromCharCode(65+i)}</span><span>${esc(option.text)}</span></button>`).join('')}</div><div class="quiz-controls"><button class="secondary-button" data-action="quiz-back" ${index === 0 ? 'disabled' : ''}>← Back</button><button class="primary-button" data-action="quiz-next" ${selected === null ? 'disabled' : ''}>${index === questions.length - 1 ? 'See my results' : 'Next question →'}</button></div></section>`;
+    return `<div class="page-heading"><div><div class="eyebrow">Diagnostic · ${esc(q.topic)} · ${esc(q.generatedBy || 'Local source match')}</div><h1>Show what you know.</h1><p class="page-subtitle">Take your time. You can’t lose progress by going back.</p></div></div><div class="quiz-progress"><span>Question ${index + 1} of ${questions.length}</span><div class="progress-track"><i style="width:${pct}%"></i></div><span>${pct}%</span></div><section class="question-card"><div class="question-overline">${esc(q.topic)} · Question ${index + 1}</div><h2>${esc(q.prompt)}</h2><div class="citation">⌕ Source: ${esc(q.citation)}</div><div class="option-list">${q.options.map((option, i) => `<button class="option ${selected === i ? 'selected' : ''}" data-action="answer" data-index="${i}" aria-pressed="${selected === i}" ${aiBusy ? 'disabled' : ''}><span class="option-letter">${String.fromCharCode(65+i)}</span><span>${esc(option.text)}</span></button>`).join('')}</div><div class="quiz-controls"><button class="secondary-button" data-action="quiz-back" ${index === 0 || aiBusy ? 'disabled' : ''}>← Back</button><button class="primary-button" data-action="quiz-next" ${selected === null || aiBusy ? 'disabled' : ''}>${aiBusy ? 'Checking answers…' : index === questions.length - 1 ? 'See my results' : 'Next question →'}</button></div></section>`;
   }
-  function beginQuiz() {
-    const questions = makeQuiz();
+  async function beginQuiz() {
+    if (aiBusy) return;
+    let questions = [];
+    if (aiStatus.configured) {
+      aiBusy = true; render();
+      try {
+        const result = await apiPost('diagnostic', { topics: rankedTopics().map(({topic,score}) => ({topic,score})), chunks: getChunks() });
+        questions = normalizeGeneratedQuestions(result.questions || []);
+      } catch (error) {
+        notify(`AI generation failed; using local demo questions. ${error.message}`);
+      }
+    } else {
+      notify('Local demo mode: add a key in .env for model-generated questions and feedback.');
+    }
+    if (!questions.length) questions = makeQuiz();
+    aiBusy = false;
     if (!questions.length) { notify('Add notes or a past paper to build a diagnostic.'); route('materials'); return; }
     quizSession = { questions, index: 0, answers: Array(questions.length).fill(null) };
     render();
   }
-  function finishQuiz() {
-    const questions = quizSession.questions;
+  async function finishQuiz() {
+    if (!quizSession || aiBusy) return;
+    const session = quizSession;
+    if (session.answers.some(answer => answer === null)) { notify('Answer each question before finishing.'); return; }
+    let aiFeedback = {};
+    if (aiStatus.configured) {
+      aiBusy = true; render();
+      try {
+        const result = await apiPost('grade', { questions: session.questions.map((q,i) => ({ ...q, options: q.options.map(option => option.text), selectedIndex: session.answers[i] })) });
+        aiFeedback = Object.fromEntries((result.results || []).map(item => [item.index, item.feedback]));
+      } catch (error) {
+        notify(`AI feedback failed; showing source-based answer checks. ${error.message}`);
+      }
+      aiBusy = false;
+    }
+    if (quizSession !== session) return;
+    const questions = session.questions;
     const topicResults = {};
     questions.forEach((q, i) => {
       topicResults[q.topic] ||= { correct: 0, total: 0, note: '' };
       topicResults[q.topic].total++;
-      if (quizSession.answers[i] === q.answerIndex) topicResults[q.topic].correct++;
-      else topicResults[q.topic].note = 'Revisit the cited source, then try to recall the idea without looking.';
+      if (session.answers[i] === q.answerIndex) topicResults[q.topic].correct++;
+      else topicResults[q.topic].note = aiFeedback[i] || 'Revisit the cited source, then try to recall the idea without looking.';
     });
-    const percent = Math.round(questions.reduce((sum, q, i) => sum + (quizSession.answers[i] === q.answerIndex ? 1 : 0), 0) / questions.length * 100);
+    const percent = Math.round(questions.reduce((sum, q, i) => sum + (session.answers[i] === q.answerIndex ? 1 : 0), 0) / questions.length * 100);
     for (const [topic, result] of Object.entries(topicResults)) {
       const score = Math.round(result.correct / result.total * 100);
       state.mastery[topic] = Math.round(topicScore(topic) * .4 + score * .6);
     }
     const date = new Date().toISOString().slice(0,10);
-    const attempt = { id: `attempt-${Date.now()}`, date, label: `Diagnostic ${state.attempts.length + 1}`, percent, topicScores: Object.fromEntries(currentTopics().map(topic => [topic, topicScore(topic)])), topics: topicResults, review: questions.map((q, i) => ({ ...q, selected: quizSession.answers[i], correct: quizSession.answers[i] === q.answerIndex })) };
+    const attempt = { id: `attempt-${Date.now()}`, date, label: `Diagnostic ${state.attempts.length + 1}`, percent, topicScores: Object.fromEntries(currentTopics().map(topic => [topic, topicScore(topic)])), topics: topicResults, review: questions.map((q, i) => ({ ...q, selected: session.answers[i], correct: session.answers[i] === q.answerIndex, feedback: aiFeedback[i] || q.explanation || '' })) };
     state.attempts.push(attempt); state.lastReview = attempt; quizSession = null; state.planTasks = null; state.completedTasks = []; save(); route('report'); notify('Your topic map and plan have been updated.');
   }
   function renderReport() {
     const ranked = rankedTopics();
     const attempt = state.lastReview;
     const label = attempt ? `Diagnostic score · ${attempt.percent}%` : 'Based on your latest saved scores';
-    return `<div class="page-heading"><div><div class="eyebrow">The main output · a diagnosis, not just answers</div><h1>Your gap report</h1><p class="page-subtitle">${esc(label)}. Use the reasons and citations to decide where to spend your time.</p></div><button class="primary-button" data-route="plan">Build my revision plan →</button></div><div class="dashboard-grid"><section class="panel"><div class="panel-head"><div><h2>Topic diagnosis</h2><p>Weak · below 55% &nbsp; Medium · 55–77% &nbsp; Strong · 78%+</p></div><span class="pill ${ranked[0]?.level || 'medium'}">${ranked.filter(item => item.level === 'weak').length} NEED FOCUS</span></div><div class="report-list">${ranked.map(({topic,score,level:lvl}) => `<article class="report-topic"><i class="topic-dot" style="background:${lvl==='weak'?'#bd6a56':lvl==='medium'?'#d0a54e':'#6ba27b'}"></i><div class="topic-label"><b>${esc(topic)}</b></div><div class="progress-track"><i style="width:${score}%;background:${lvl==='weak'?'#bd6a56':lvl==='medium'?'#d0a54e':'#6ba27b'}"></i></div><strong class="topic-percent">${score}%</strong><p class="report-reason">${esc(reasonFor(topic))} <span class="pill ${lvl}">${levelLabel(topic)}</span></p></article>`).join('')}</div></section><aside class="panel"><div class="panel-head"><div><h2>Your next steps</h2><p>Ordered by need and exam frequency</p></div></div>${ranked.slice(0,3).map((item,i)=>`<div class="exam-frequency"><span>${String(i+1).padStart(2,'0')} &nbsp; ${esc(item.topic)}</span><b>${esc(examFrequency(item.topic))}</b></div>`).join('')}<div class="panel-footer"><span>Priority considers confidence and exam frequency.</span></div></aside></div>${attempt?.review?.length ? `<section class="panel" style="margin-top:16px"><div class="panel-head"><div><h2>Answer review</h2><p>See what your selection matched in the source passage.</p></div></div><div class="report-list">${attempt.review.map((q,i)=>`<article class="priority-card" style="margin:0"><div class="priority-top"><div><div class="priority-title">${i+1}. ${esc(q.topic)} · ${q.correct?'Correct':'Review this'}</div><div class="priority-meta">${esc(q.citation)}</div></div><span class="pill ${q.correct?'strong':'weak'}">${q.correct?'RIGHT':'WRONG'}</span></div><p class="priority-reason"><b>Your answer:</b> ${esc(q.selected === null ? 'No answer selected' : q.options[q.selected]?.text)}<br><b>Source says:</b> ${esc(q.correctText)}<br>${q.correct?'This statement matches the retrieved material.':'This choice was not supported by the cited passage; compare it with the source statement above.'}</p></article>`).join('')}</div></section>` : ''}`;
+    return `<div class="page-heading"><div><div class="eyebrow">The main output · a diagnosis, not just answers</div><h1>Your gap report</h1><p class="page-subtitle">${esc(label)}. Use the reasons and citations to decide where to spend your time.</p></div><button class="primary-button" data-route="plan">Build my revision plan →</button></div><div class="dashboard-grid"><section class="panel"><div class="panel-head"><div><h2>Topic diagnosis</h2><p>Weak · below 55% &nbsp; Medium · 55–77% &nbsp; Strong · 78%+</p></div><span class="pill ${ranked[0]?.level || 'medium'}">${ranked.filter(item => item.level === 'weak').length} NEED FOCUS</span></div><div class="report-list">${ranked.map(({topic,score,level:lvl}) => `<article class="report-topic"><i class="topic-dot" style="background:${lvl==='weak'?'#bd6a56':lvl==='medium'?'#d0a54e':'#6ba27b'}"></i><div class="topic-label"><b>${esc(topic)}</b></div><div class="progress-track"><i style="width:${score}%;background:${lvl==='weak'?'#bd6a56':lvl==='medium'?'#d0a54e':'#6ba27b'}"></i></div><strong class="topic-percent">${score}%</strong><p class="report-reason">${esc(reasonFor(topic))} <span class="pill ${lvl}">${levelLabel(topic)}</span></p></article>`).join('')}</div></section><aside class="panel"><div class="panel-head"><div><h2>Your next steps</h2><p>Ordered by need and mapped past-paper frequency</p></div></div>${ranked.slice(0,3).map((item,i)=>`<div class="exam-frequency"><span>${String(i+1).padStart(2,'0')} &nbsp; ${esc(item.topic)}</span><b>${esc(examFrequency(item.topic))}</b></div>`).join('')}<div class="panel-footer"><span>Priority combines current confidence with mapped past-paper counts.</span></div></aside></div>${attempt?.review?.length ? `<section class="panel" style="margin-top:16px"><div class="panel-head"><div><h2>Answer review</h2><p>See what your selection matched in the source passage.</p></div></div><div class="report-list">${attempt.review.map((q,i)=>`<article class="priority-card" style="margin:0"><div class="priority-top"><div><div class="priority-title">${i+1}. ${esc(q.topic)} · ${q.correct?'Correct':'Review this'}</div><div class="priority-meta">${esc(q.citation)}</div></div><span class="pill ${q.correct?'strong':'weak'}">${q.correct?'RIGHT':'WRONG'}</span></div><p class="priority-reason"><b>Your answer:</b> ${esc(q.selected === null ? 'No answer selected' : q.options[q.selected]?.text)}<br><b>Expected answer:</b> ${esc(q.correctText)}<br>${esc(q.feedback || (q.correct?'This answer matches the retrieved material.':'Compare your selection with the cited source passage.'))}</p></article>`).join('')}</div></section>` : ''}`;
   }
 
   function ensurePlan() {
     if (Array.isArray(state.planTasks) && state.planTasks.length) return state.planTasks;
-    const ranked = rankedTopics().map(item => ({ ...item, importance: ({ Photosynthesis: 1.35, Genetics: 1.25, 'Membrane transport': 1.15, 'Cellular respiration': 1.15, Ecology: .95, 'Cell structure': .9 })[item.topic] || 1 }));
+    const ranked = rankedTopics().map(item => ({ ...item, importance: 1 + Math.min(.8, (state.paperMap || []).filter(question => question.topic === item.topic).length * .2) }));
     const totalMinutes = state.planDays * state.hoursPerDay * 60;
     const sessionsPerDay = Math.min(8, Math.max(1, Math.floor(state.hoursPerDay * 2)));
     let blocks = Math.max(ranked.length, Math.min(state.planDays * sessionsPerDay, Math.floor(totalMinutes / 30)));
@@ -298,7 +410,7 @@
     const tasks = ensurePlan();
     const grouped = Array.from({ length: state.planDays }, (_, i) => tasks.filter(task => task.day === i + 1));
     const done = tasks.filter(task => state.completedTasks.includes(task.id)).length;
-    return `<div class="page-heading"><div><div class="eyebrow">A plan that changes as you improve</div><h1>Your revision plan</h1><p class="page-subtitle">Weak topics and exam frequency come first. Mark sessions complete as you go.</p></div></div><section class="panel"><div class="panel-head"><div><h2>Make it fit your week</h2><p>Adjust the time you have. The priority order follows your latest gap report.</p></div><span class="pill medium">${done}/${tasks.length} SESSIONS DONE</span></div><form id="plan-settings" class="plan-inputs"><label class="field">Days until exam<input type="number" name="days" value="${state.planDays}" min="1" max="60" required></label><label class="field">Hours available each day<input type="number" name="hours" value="${state.hoursPerDay}" min="1" max="12" required></label><button class="secondary-button" type="submit">Update my plan</button></form></section><div class="page-grid" style="margin-top:16px"><section class="panel"><div class="panel-head"><div><h2>${state.planDays}-day focus plan</h2><p>${state.planDays * state.hoursPerDay} hours available · ${tasks.length} short sessions</p></div></div>${grouped.map((day,i)=>day.length?`<div class="card-headline"><h3>Day ${i+1}</h3><span class="inline-note">${day.reduce((n,t)=>n+t.minutes,0)} min</span></div><div class="revision-list">${day.map(task=>{const checked=state.completedTasks.includes(task.id);return `<article class="plan-card ${checked?'done':''}"><button class="plan-check" data-action="toggle-task" data-id="${esc(task.id)}" aria-label="Mark ${checked?'incomplete':'complete'}">${checked?'✓':''}</button><div class="plan-content"><b>${esc(task.title)}</b><p>${esc(task.description)}</p></div><span class="plan-duration">${task.minutes} min</span></article>`}).join('')}`:'').join('')}</section><aside class="panel"><div class="panel-head"><div><h2>Why this order?</h2><p>Your revision follows the evidence.</p></div></div><div class="method-card"><div class="method-step"><b>01</b><span>Lowest-confidence topics appear first.</span></div><div class="method-step"><b>02</b><span>Frequently tested topics get more sessions.</span></div><div class="method-step"><b>03</b><span>New quiz results rebuild your plan automatically.</span></div></div><div class="card-headline"><h3>Current priority</h3></div><div class="priority-card"><div class="priority-title">${esc(rankedTopics()[0]?.topic || 'Your syllabus')}</div><p class="priority-reason" style="margin-bottom:0">${esc(reasonFor(rankedTopics()[0]?.topic || ''))}</p></div><button class="secondary-button" data-route="diagnosis" style="width:100%;margin-top:7px">Retake diagnostic</button></aside></div>`;
+    return `<div class="page-heading"><div><div class="eyebrow">A plan that changes as you improve</div><h1>Your revision plan</h1><p class="page-subtitle">Weak topics and mapped past-paper frequency come first. Mark sessions complete as you go.</p></div></div><section class="panel"><div class="panel-head"><div><h2>Make it fit your week</h2><p>Adjust the time you have. Priority uses your current confidence and mapped paper-question counts.</p></div><span class="pill medium">${done}/${tasks.length} SESSIONS DONE</span></div><form id="plan-settings" class="plan-inputs"><label class="field">Days until exam<input type="number" name="days" value="${state.planDays}" min="1" max="60" required></label><label class="field">Hours available each day<input type="number" name="hours" value="${state.hoursPerDay}" min="1" max="12" required></label><button class="secondary-button" type="submit">Update my plan</button></form></section><div class="page-grid" style="margin-top:16px"><section class="panel"><div class="panel-head"><div><h2>${state.planDays}-day focus plan</h2><p>${state.planDays * state.hoursPerDay} hours available · ${tasks.length} short sessions</p></div></div>${grouped.map((day,i)=>day.length?`<div class="card-headline"><h3>Day ${i+1}</h3><span class="inline-note">${day.reduce((n,t)=>n+t.minutes,0)} min</span></div><div class="revision-list">${day.map(task=>{const checked=state.completedTasks.includes(task.id);return `<article class="plan-card ${checked?'done':''}"><button class="plan-check" data-action="toggle-task" data-id="${esc(task.id)}" aria-label="Mark ${checked?'incomplete':'complete'}">${checked?'✓':''}</button><div class="plan-content"><b>${esc(task.title)}</b><p>${esc(task.description)}</p></div><span class="plan-duration">${task.minutes} min</span></article>`}).join('')}`:'').join('')}</section><aside class="panel"><div class="panel-head"><div><h2>Why this order?</h2><p>Your revision follows the evidence.</p></div></div><div class="method-card"><div class="method-step"><b>01</b><span>Lowest-confidence topics appear first.</span></div><div class="method-step"><b>02</b><span>Topics with more mapped paper questions get more sessions.</span></div><div class="method-step"><b>03</b><span>New quiz results rebuild your plan automatically.</span></div></div><div class="card-headline"><h3>Current priority</h3></div><div class="priority-card"><div class="priority-title">${esc(rankedTopics()[0]?.topic || 'Your syllabus')}</div><p class="priority-reason" style="margin-bottom:0">${esc(reasonFor(rankedTopics()[0]?.topic || ''))}</p></div><button class="secondary-button" data-route="diagnosis" style="width:100%;margin-top:7px">Retake diagnostic</button></aside></div>`;
   }
 
   function retrieve(query) {
@@ -308,13 +420,24 @@
   }
   function renderChat() {
     const messages = chatHistory.map(message => `<div class="message ${message.role}">${esc(message.text)}${message.citation ? `<span class="message-cite">Source · ${esc(message.citation)}</span>` : ''}</div>`).join('');
-    return `<div class="page-heading"><div><div class="eyebrow">Ask questions. Get material-backed answers.</div><h1>Explain a topic</h1><p class="page-subtitle">The answer comes from your saved sources; if they don’t cover it, GapFinder will say so.</p></div></div><div class="page-grid"><section class="chat-shell"><div class="chat-header"><span class="chat-orb">g.</span><div><b>Study companion</b><small><i class="dot"></i> Searching your uploaded material</small></div></div><div class="chat-messages" id="chat-messages">${messages}</div><div class="chat-suggestions"><button data-action="suggest-chat" data-text="Explain photosynthesis">Explain photosynthesis</button><button data-action="suggest-chat" data-text="What is active transport?">What is active transport?</button><button data-action="suggest-chat" data-text="Where does glycolysis happen?">Where does glycolysis happen?</button></div><form class="chat-form" id="chat-form"><input class="chat-input" name="message" placeholder="Ask about a topic in your material…" autocomplete="off" required><button class="primary-button" type="submit">Send →</button></form></section><aside class="panel"><div class="panel-head"><div><h2>How answers stay grounded</h2><p>A small, visible retrieval pipeline</p></div></div><div class="method-card"><h3>Retrieve first, then respond</h3><p>The app matches your words to uploaded source passages. It uses the best matching passage to explain a topic and attaches its filename and section.</p><div class="method-step"><b>01</b><span><strong>Search</strong> your own notes and papers.</span></div><div class="method-step"><b>02</b><span><strong>Show the source</strong> for every supported response.</span></div><div class="method-step"><b>03</b><span><strong>Say when there’s no match</strong> instead of guessing.</span></div></div><p class="inline-note" style="margin-top:12px">Retrieval uses keyword overlap in this demo. No outside knowledge or internet search is used to answer.</p></aside></div>`;
+    return `<div class="page-heading"><div><div class="eyebrow">Ask questions. Get material-backed answers.</div><h1>Explain a topic</h1><p class="page-subtitle">The answer comes from your saved sources; if they don’t cover it, GapFinder will say so.</p></div></div><div class="page-grid"><section class="chat-shell"><div class="chat-header"><span class="chat-orb">g.</span><div><b>Study companion</b><small><i class="dot"></i> ${aiStatus.configured ? `AI · ${esc(aiStatus.model)}` : 'Local source search'}</small></div></div><div class="chat-messages" id="chat-messages">${messages}</div><div class="chat-suggestions"><button data-action="suggest-chat" data-text="Explain photosynthesis">Explain photosynthesis</button><button data-action="suggest-chat" data-text="What is active transport?">What is active transport?</button><button data-action="suggest-chat" data-text="Where does glycolysis happen?">Where does glycolysis happen?</button></div><form class="chat-form" id="chat-form"><input class="chat-input" name="message" placeholder="Ask about a topic in your material…" autocomplete="off" required><button class="primary-button" type="submit">Send →</button></form></section><aside class="panel"><div class="panel-head"><div><h2>How answers stay grounded</h2><p>Retrieval first, then generation</p></div></div><div class="method-card"><h3>Only retrieved passages become context</h3><p>The server ranks your source passages against the question, sends the strongest matches to the model, validates its cited source IDs, and shows the original citations.</p><div class="method-step"><b>01</b><span><strong>Retrieve</strong> relevant source sections using keyword ranking.</span></div><div class="method-step"><b>02</b><span><strong>Generate</strong> an answer from those sections only.</span></div><div class="method-step"><b>03</b><span><strong>Decline</strong> when no retrieved section supports an answer.</span></div></div><p class="inline-note" style="margin-top:12px">${aiStatus.configured ? `Your question and retrieved passages are sent to ${esc(aiStatus.model)}. Uploaded files remain in this browser.` : 'The current page is in local demo mode. Start server.py with a local API key to enable the AI model.'}</p></aside></div>`;
   }
-  function answerChat(query) {
-    const hit = retrieve(query);
+  async function answerChat(query) {
     chatHistory.push({ role: 'user', text: query });
-    if (hit) chatHistory.push({ role: 'assistant', text: `In your material: ${hit.text}\n\nThat’s the closest passage I found for “${query}”.`, citation: hit.citation });
-    else chatHistory.push({ role: 'assistant', text: `I couldn’t find this in your uploaded material, so I don’t want to guess. Try a topic name from your syllabus or add notes that cover it.` });
+    chatHistory.push({ role: 'assistant', text: aiStatus.configured ? 'Retrieving relevant passages and preparing a source-grounded answer…' : 'Searching your saved sources…', pending: true });
+    render();
+    let answer;
+    try {
+      if (!aiStatus.configured) throw new Error('Local mode');
+      const result = await apiPost('explain', { query, chunks: getChunks() });
+      answer = { role: 'assistant', text: result.answer || 'I could not find enough information in the uploaded material to answer that.', citation: (result.sources || []).map(source => source.citation).join(' · ') };
+    } catch (error) {
+      const hit = retrieve(query);
+      answer = hit ? { role: 'assistant', text: `In your material: ${hit.text}\n\nThis is the closest passage I found for “${query}”.`, citation: hit.citation } : { role: 'assistant', text: `I couldn’t find this in your uploaded material, so I don’t want to guess. Try a topic name from your syllabus or add notes that cover it.` };
+      if (aiStatus.configured) notify(`AI answer unavailable; showing the closest source passage. ${error.message}`);
+    }
+    if (chatHistory.at(-1)?.pending) chatHistory.pop();
+    chatHistory.push(answer);
     render();
     const messages = document.getElementById('chat-messages'); if (messages) messages.scrollTop = messages.scrollHeight;
   }
@@ -329,8 +452,21 @@
 
   function render() {
     if (!loggedIn) { renderLogin(); return; }
+    ensurePaperMap();
     const views = { overview: renderOverview, materials: renderMaterials, diagnosis: renderQuiz, report: renderReport, plan: renderPlan, ask: renderChat, progress: renderProgress };
     document.getElementById('app').innerHTML = shell((views[currentView] || renderOverview)());
+  }
+  async function loadAIStatus() {
+    try {
+      const response = await fetch('/api/health', { cache: 'no-store' });
+      if (!response.ok) return;
+      const status = await response.json();
+      aiStatus = { configured: Boolean(status.configured), provider: status.provider || 'Local retrieval', model: status.model || null };
+      if (aiStatus.configured) state.paperMapSignature = '';
+      render();
+    } catch (_) {
+      // Opening index.html directly stays supported as a local-only demo.
+    }
   }
 
   async function extractPdf(file) {
@@ -356,7 +492,7 @@
       if (text.length > 900_000) { notify('That file has too much text for this local demo. Try a smaller section.'); return; }
       state.documents.push({ id: `upload-${Date.now()}`, name: file.name, kind, text, seeded: false });
       if (kind === 'syllabus') for (const topic of currentTopics()) if (!(topic in state.mastery)) state.mastery[topic] = 55;
-      state.planTasks = null; state.completedTasks = []; save(); render(); notify(`${file.name} added to your sources.`);
+      state.paperMapSignature = ''; state.planTasks = null; state.completedTasks = []; save(); render(); notify(`${file.name} added to your sources.`);
     } catch (error) { notify(error.message || 'Could not read that file.'); }
   }
 
@@ -375,7 +511,7 @@
       if (quizSession.answers[quizSession.index] === null) return;
       if (quizSession.index + 1 < quizSession.questions.length) { quizSession.index++; render(); } else finishQuiz();
     }
-    if (action === 'remove-doc') { state.documents = state.documents.filter(doc => doc.id !== target.dataset.id); state.planTasks = null; save(); render(); notify('Source removed.'); }
+    if (action === 'remove-doc') { state.documents = state.documents.filter(doc => doc.id !== target.dataset.id); state.paperMapSignature = ''; state.planTasks = null; save(); render(); notify('Source removed.'); }
     if (action === 'toggle-task') {
       const id = target.dataset.id;
       state.completedTasks = state.completedTasks.includes(id) ? state.completedTasks.filter(item => item !== id) : [...state.completedTasks, id]; save(); render();
@@ -399,4 +535,5 @@
     if (event.target.id === 'chat-form') { event.preventDefault(); const form = new FormData(event.target); const query = String(form.get('message') || '').trim(); if (query) answerChat(query); }
   });
   render();
+  loadAIStatus();
 })();
